@@ -6,11 +6,22 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
+
+# If the Mac was asleep and several scheduled runs piled up, keep only one pending run.
+concurrency:
+  group: update-pair
+  cancel-in-progress: false
 
 jobs:
   run-commands:
-    runs-on: ubuntu-latest
+    # Self-hosted MacBook (labels: self-hosted, macOS, X64). GitHub-hosted runners are
+    # blocked by x.com's Cloudflare challenge since 2026-09-05.
+    runs-on: [self-hosted, macOS]
+    # A run that cannot reach x.com would otherwise sit for ~2.5 h; a healthy run takes minutes.
+    timeout-minutes: 30
+    env:
+      # main.ts uses `headless: true` (full Chrome); chrome-headless-shell is never used, skip its ~86 MB download.
+      PUPPETEER_SKIP_CHROME_HEADLESS_SHELL_DOWNLOAD: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,26 +29,37 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          # Pinned on purpose: every new 22.x is a ~48 MB download on the metered runner. Bump by hand.
+          node-version: "22.23.2"
 
       - name: Commit Setup
+        # Repo-local config only; --global would edit the git config of the MacBook's user account.
         run: |
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "GitHub Action"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "GitHub Action"
 
-      - run: npm install
-      - run: npm run start
+      - name: Install dependencies
+        # Lockfile-exact install; served from the runner's npm cache (~/.npm) after the first run.
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Generate pairs
+        run: npm run start
 
       - name: Check pair.json array length
+        # Node instead of jq: jq is not preinstalled on macOS.
         run: |
-          jq -e 'length > 0' pair.json || (echo "Error: pair.json array is empty" && exit 1)
+          node -e '
+            const a = JSON.parse(require("fs").readFileSync("pair.json", "utf8"));
+            if (!Array.isArray(a) || a.length === 0) { console.error("Error: pair.json array is empty"); process.exit(1); }
+            console.log(`pair.json: ${a.length} entries`);
+          '
 
       - name: Commit results
         run: |
-          if git diff --quiet; then
+          if git diff --quiet -- pair.json; then
             echo "No changes to commit."
           else
-            git add .
+            git add pair.json
             git commit -m "Update pair"
             git push origin main
           fi
